@@ -1,0 +1,18 @@
+{
+  "name": "gopro-live-price-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Live GPRO price bridge for the GoPro investment journal",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "ws": "^8.18.0"
+  }
+}
