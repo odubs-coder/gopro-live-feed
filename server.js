@@ -3,7 +3,8 @@
 
 const express = require("express");
 const cors = require("cors");
-const WebSocket = require("ws");
+const http = require("http");
+const { WebSocket, WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 8787;
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
@@ -16,6 +17,45 @@ if (!FINNHUB_API_KEY) {
 
 const app = express();
 app.use(cors({ origin: ALLOWED_ORIGIN === "*" ? true : ALLOWED_ORIGIN }));
+const server = http.createServer(app);
+
+const wss = new WebSocketServer({
+  server,
+  path: "/ws"
+});
+
+wss.on("connection", (client, req) => {
+  const origin = req.headers.origin;
+
+  if (
+    ALLOWED_ORIGIN !== "*" &&
+    origin !== ALLOWED_ORIGIN
+  ) {
+    client.close();
+    return;
+  }
+
+  console.log("Journal connected to live feed");
+
+  // Immediately give the page our latest known data
+  client.send(JSON.stringify({
+    type: "snapshot",
+    symbol: "GPRO",
+    price: latestPrice,
+    timestamp: latestTs,
+    usdToGbp
+  }));
+});
+
+function broadcast(data) {
+  const message = JSON.stringify(data);
+
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(message);
+    }
+  });
+}
 
 let latestPrice = null;
 let latestTs = null;
@@ -59,10 +99,20 @@ function connectFinnhub() {
       const msg = JSON.parse(raw.toString());
       if (msg.type === "trade" && Array.isArray(msg.data)) {
         const trades = msg.data.filter(t => t.s === "GPRO" && Number(t.p) > 0);
-        if (trades.length) {
-          const t = trades[trades.length - 1];
-          latestPrice = Number(t.p);
-          latestTs = Number(t.t) || Date.now();
+       if (trades.length) {
+  const t = trades[trades.length - 1];
+
+  latestPrice = Number(t.p);
+  latestTs = Number(t.t) || Date.now();
+
+  broadcast({
+    type: "trade",
+    symbol: "GPRO",
+    price: latestPrice,
+    timestamp: latestTs,
+    usdToGbp
+  });
+}
         }
       }
     } catch (err) {
@@ -101,4 +151,6 @@ app.get("/health", (req, res) => {
   res.json({ ok: true, websocket: wsState, hasPrice: latestPrice !== null, hasFx: usdToGbp !== null });
 });
 
-app.listen(PORT, () => console.log(`GPRO live service listening on port ${PORT}`));
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`GPRO live service listening on port ${PORT}`);
+});
