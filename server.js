@@ -1007,6 +1007,16 @@ server.listen(
 
     connectFinnhub();
 
+    setInterval(() => {
+  broadcast({
+    type: "heartbeat",
+    serverTime: Date.now(),
+    symbol: "GPRO",
+    price: latestPrice,
+    marketTimestamp: latestTs,
+    source: latestSource
+  });
+}, 1000);
 
     /*
       BACKUP PATH
