@@ -171,9 +171,6 @@ setInterval(
    Finnhub WebSocket
 -------------------------------- */
 
-let socket = null;
-
-let reconnectTimer = null;
 async function getInitialGproPrice() {
   try {
     const response = await fetch(
@@ -191,7 +188,6 @@ async function getInitialGproPrice() {
     if (Number(data.c) > 0) {
       latestPrice = Number(data.c);
 
-      // Finnhub's quote timestamp is seconds.
       latestTs = Number(data.t)
         ? Number(data.t) * 1000
         : Date.now();
@@ -215,7 +211,8 @@ async function getInitialGproPrice() {
     );
   }
 }
-function getInitialGproPrice();
+
+getInitialGproPrice();
 connectFinnhub();
 
   clearTimeout(reconnectTimer);
