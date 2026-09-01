@@ -174,8 +174,49 @@ setInterval(
 let socket = null;
 
 let reconnectTimer = null;
+async function getInitialGproPrice() {
+  try {
+    const response = await fetch(
+      `https://finnhub.io/api/v1/quote?symbol=GPRO&token=${encodeURIComponent(
+        FINNHUB_API_KEY
+      )}`
+    );
 
-function connectFinnhub() {
+    if (!response.ok) {
+      throw new Error(`Quote HTTP ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    if (Number(data.c) > 0) {
+      latestPrice = Number(data.c);
+
+      // Finnhub's quote timestamp is seconds.
+      latestTs = Number(data.t)
+        ? Number(data.t) * 1000
+        : Date.now();
+
+      console.log(
+        `Initial GPRO price loaded: $${latestPrice}`
+      );
+
+      broadcast({
+        type: "trade",
+        symbol: "GPRO",
+        price: latestPrice,
+        timestamp: latestTs,
+        usdToGbp
+      });
+    }
+  } catch (err) {
+    console.error(
+      "Initial GPRO quote failed:",
+      err.message
+    );
+  }
+}
+function getInitialGproPrice();
+connectFinnhub();
 
   clearTimeout(reconnectTimer);
 
