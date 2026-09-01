@@ -6,31 +6,27 @@ const http = require("http");
 const { WebSocket, WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 8787;
+const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 
-const T212_API_KEY = process.env.TRADING212_API_KEY;
-const T212_API_SECRET = process.env.TRADING212_API_SECRET;
+const SYMBOL = "GPRO";
 
-const T212_ENV = (
-  process.env.TRADING212_ENV || "live"
-).toLowerCase();
+// Backup REST check.
+// Real-time updates still come through WebSocket.
+const REST_REFRESH_MS = 15000;
 
-if (!T212_API_KEY || !T212_API_SECRET) {
+if (!FINNHUB_API_KEY) {
   console.error(
-    "Missing TRADING212_API_KEY or TRADING212_API_SECRET environment variable."
+    "Missing FINNHUB_API_KEY environment variable."
   );
 
   process.exit(1);
 }
 
-const T212_BASE_URL =
-  T212_ENV === "demo"
-    ? "https://demo.trading212.com/api/v0"
-    : "https://live.trading212.com/api/v0";
 
-/* -----------------------------
-   Express
------------------------------ */
+/* =====================================
+   EXPRESS
+===================================== */
 
 const app = express();
 
@@ -46,9 +42,10 @@ app.use(
 const server =
   http.createServer(app);
 
-/* -----------------------------
-   Browser WebSocket
------------------------------ */
+
+/* =====================================
+   JOURNAL WEBSOCKET
+===================================== */
 
 const wss =
   new WebSocketServer({
@@ -56,61 +53,95 @@ const wss =
     path: "/ws",
   });
 
-/* -----------------------------
-   Current GPRO state
------------------------------ */
+
+/* =====================================
+   CURRENT STATE
+===================================== */
 
 let latestPrice = null;
 let latestTs = null;
 
 let latestSource =
-  "Trading 212";
-
-let latestPosition = null;
-
-let usdToGbp = null;
-
-let lastSuccessfulPoll = null;
-
-let pollState =
   "starting";
 
+let finnhubState =
+  "connecting";
+
+let usdToGbp = null;
+let fxUpdatedAt = null;
+
+let lastRestRefresh = null;
 let lastError = null;
 
-let pollInFlight = false;
 
-/* -----------------------------
-   Helpers
------------------------------ */
+/* =====================================
+   HELPERS
+===================================== */
 
-function sendJson(client, data) {
+function toMs(timestamp) {
+
+  const value =
+    Number(timestamp);
+
+  if (
+    !Number.isFinite(value) ||
+    value <= 0
+  ) {
+    return Date.now();
+  }
+
+  // Finnhub REST uses seconds.
+  // Finnhub WebSocket uses milliseconds.
+  return value < 1e12
+    ? value * 1000
+    : value;
+}
+
+
+function sendJson(
+  client,
+  data
+) {
+
   if (
     client.readyState ===
     WebSocket.OPEN
   ) {
+
     client.send(
       JSON.stringify(data)
     );
+
   }
 }
 
+
 function broadcast(data) {
+
   for (
     const client
     of wss.clients
   ) {
+
     sendJson(
       client,
       data
     );
+
   }
 }
 
-function currentSnapshot() {
-  return {
-    type: "snapshot",
 
-    symbol: "GPRO",
+function snapshotPayload(
+  type = "snapshot"
+) {
+
+  return {
+
+    type,
+
+    symbol:
+      SYMBOL,
 
     price:
       latestPrice,
@@ -120,28 +151,96 @@ function currentSnapshot() {
 
     usdToGbp,
 
+    fxUpdatedAt,
+
     source:
       latestSource,
 
-    pollState,
+    feedState:
+      finnhubState,
 
-    position:
-      latestPosition,
   };
 }
 
-function numberOrNull(value) {
-  const n =
-    Number(value);
 
-  return Number.isFinite(n)
-    ? n
-    : null;
+/* =====================================
+   PRICE UPDATE
+===================================== */
+
+function updatePrice(
+  price,
+  timestamp,
+  source
+) {
+
+  const p =
+    Number(price);
+
+  const ts =
+    toMs(timestamp);
+
+
+  if (!(p > 0)) {
+    return false;
+  }
+
+
+  /*
+    Never allow an older REST quote
+    to replace a newer WebSocket trade.
+  */
+
+  if (
+    latestTs &&
+    ts < latestTs
+  ) {
+
+    return false;
+
+  }
+
+
+  const changed =
+    latestPrice !== p ||
+    latestTs !== ts ||
+    latestSource !== source;
+
+
+  latestPrice =
+    p;
+
+  latestTs =
+    ts;
+
+  latestSource =
+    source;
+
+
+  if (changed) {
+
+    /*
+      Keep "trade" here because
+      your existing index.html
+      already understands
+      trade + snapshot messages.
+    */
+
+    broadcast(
+      snapshotPayload(
+        "trade"
+      )
+    );
+
+  }
+
+
+  return true;
 }
 
-/* -----------------------------
-   Browser connection
------------------------------ */
+
+/* =====================================
+   JOURNAL CONNECTION
+===================================== */
 
 wss.on(
   "connection",
@@ -150,47 +249,66 @@ wss.on(
     const origin =
       req.headers.origin;
 
+
     if (
       ALLOWED_ORIGIN !== "*" &&
       origin !== ALLOWED_ORIGIN
     ) {
+
       console.warn(
         `Rejected WebSocket origin: ${origin}`
       );
+
 
       client.close(
         1008,
         "Origin not allowed"
       );
 
+
       return;
     }
+
 
     console.log(
       "Journal connected to live feed"
     );
 
-    client.isAlive = true;
+
+    client.isAlive =
+      true;
+
 
     client.on(
       "pong",
       () => {
-        client.isAlive = true;
+
+        client.isAlive =
+          true;
+
       }
     );
 
-    // Immediately send
-    // latest known GPRO info
+
+    /*
+      Send the latest known
+      GPRO price immediately.
+    */
+
     sendJson(
       client,
-      currentSnapshot()
+      snapshotPayload(
+        "snapshot"
+      )
     );
+
   }
 );
 
-/* -----------------------------
-   Keep WebSocket alive
------------------------------ */
+
+/* =====================================
+   JOURNAL HEARTBEAT
+===================================== */
 
 const heartbeat =
   setInterval(
@@ -200,363 +318,531 @@ const heartbeat =
         const client
         of wss.clients
       ) {
+
         if (
           client.isAlive === false
         ) {
+
           client.terminate();
+
           continue;
+
         }
 
-        client.isAlive = false;
+
+        client.isAlive =
+          false;
+
 
         client.ping();
+
       }
 
     },
+
     30000
+
   );
+
 
 wss.on(
   "close",
   () => {
+
     clearInterval(
       heartbeat
     );
+
   }
 );
 
-/* -----------------------------
-   Trading 212 authentication
------------------------------ */
 
-function t212AuthHeader() {
+/* =====================================
+   USD → GBP
+===================================== */
 
-  const credentials =
-    Buffer.from(
-      `${T212_API_KEY}:${T212_API_SECRET}`,
-      "utf8"
-    ).toString(
-      "base64"
-    );
-
-  return (
-    `Basic ${credentials}`
-  );
-}
-
-/* -----------------------------
-   Find GoPro position
------------------------------ */
-
-function isGoProPosition(
-  position
-) {
-
-  const ticker =
-    String(
-      position?.instrument?.ticker
-      || ""
-    ).toUpperCase();
-
-  const name =
-    String(
-      position?.instrument?.name
-      || ""
-    ).toLowerCase();
-
-  return (
-    ticker === "GPRO" ||
-    ticker.startsWith(
-      "GPRO_"
-    ) ||
-    ticker.includes(
-      "GPRO"
-    ) ||
-    name.includes(
-      "gopro"
-    )
-  );
-}
-
-/* -----------------------------
-   Poll Trading 212
------------------------------ */
-
-async function pollTrading212() {
-
-  // Prevent overlapping
-  // requests
-  if (pollInFlight) {
-    return;
-  }
-
-  pollInFlight = true;
+async function refreshFx() {
 
   try {
 
-    pollState =
-      "requesting";
-
     const response =
       await fetch(
-        `${T212_BASE_URL}/equity/positions`,
+
+        "https://api.frankfurter.app/latest?from=USD&to=GBP",
+
         {
-          method: "GET",
-
-          headers: {
-            Authorization:
-              t212AuthHeader(),
-
-            Accept:
-              "application/json",
-          },
-
           cache:
             "no-store",
         }
+
       );
+
 
     if (!response.ok) {
 
-      const body =
-        await response
-          .text()
-          .catch(
-            () => ""
-          );
-
       throw new Error(
-        `Trading 212 HTTP ${
-          response.status
-        }${
-          body
-            ? `: ${body.slice(
-                0,
-                200
-              )}`
-            : ""
-        }`
+        `FX HTTP ${response.status}`
       );
+
     }
 
-    const positions =
+
+    const data =
       await response.json();
 
-    if (
-      !Array.isArray(
-        positions
-      )
-    ) {
+
+    const rate =
+      Number(
+        data?.rates?.GBP
+      );
+
+
+    if (rate > 0) {
+
+      usdToGbp =
+        rate;
+
+
+      fxUpdatedAt =
+        Date.now();
+
+
+      broadcast({
+
+        type:
+          "fx",
+
+        usdToGbp,
+
+        fxUpdatedAt,
+
+      });
+
+    }
+
+  }
+
+  catch (err) {
+
+    console.error(
+      "FX refresh failed:",
+      err.message
+    );
+
+  }
+
+}
+
+
+/* =====================================
+   FINNHUB REST QUOTE
+===================================== */
+
+async function refreshFinnhubQuote() {
+
+  try {
+
+    const response =
+      await fetch(
+
+        `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(
+          SYMBOL
+        )}&token=${encodeURIComponent(
+          FINNHUB_API_KEY
+        )}`,
+
+        {
+          cache:
+            "no-store",
+        }
+
+      );
+
+
+    if (!response.ok) {
+
       throw new Error(
-        "Trading 212 returned an unexpected positions response."
-      );
-    }
-
-    const position =
-      positions.find(
-        isGoProPosition
+        `Finnhub quote HTTP ${response.status}`
       );
 
-    if (!position) {
-
-      pollState =
-        "connected-no-gpro";
-
-      lastError =
-        "No open GoPro/GPRO position found in Trading 212.";
-
-      return;
     }
 
-    /* -------------------------
-       Extract position
-    ------------------------- */
+
+    const data =
+      await response.json();
+
 
     const price =
-      numberOrNull(
-        position.currentPrice
+      Number(
+        data.c
       );
 
-    const quantity =
-      numberOrNull(
-        position.quantity
+
+    const timestamp =
+      toMs(
+        data.t
       );
 
-    const averagePricePaid =
-      numberOrNull(
-        position.averagePricePaid
-      );
 
-    const wallet =
-      position.walletImpact
-      || {};
+    if (price > 0) {
 
-    const walletCurrency =
-      String(
-        wallet.currency
-        || ""
-      ).toUpperCase();
+      /*
+        REST is our backup.
 
-    const walletCurrentValue =
-      numberOrNull(
-        wallet.currentValue
-      );
+        It restores the price
+        after Render restarts and
+        catches anything missed by
+        the WebSocket.
+      */
 
-    const walletTotalCost =
-      numberOrNull(
-        wallet.totalCost
-      );
+      updatePrice(
 
-    if (!(price > 0)) {
-      throw new Error(
-        "Trading 212 returned no usable GPRO currentPrice."
-      );
-    }
-
-    /* -------------------------
-       Update live price
-    ------------------------- */
-
-    latestPrice =
-      price;
-
-    latestTs =
-      Date.now();
-
-    latestSource =
-      "Trading 212";
-
-    lastSuccessfulPoll =
-      latestTs;
-
-    pollState =
-      "connected";
-
-    lastError =
-      null;
-
-    /* -------------------------
-       Derive USD → GBP
-
-       If Trading 212 gives us
-       its GBP position value,
-       this makes the conversion
-       line up more closely with
-       Trading 212 itself.
-    ------------------------- */
-
-    if (
-      walletCurrency === "GBP" &&
-      walletCurrentValue > 0 &&
-      quantity > 0 &&
-      price > 0
-    ) {
-
-      const derivedFx =
-        walletCurrentValue /
-        (
-          quantity *
-          price
-        );
-
-      if (
-        Number.isFinite(
-          derivedFx
-        ) &&
-        derivedFx > 0
-      ) {
-        usdToGbp =
-          derivedFx;
-      }
-    }
-
-    /* -------------------------
-       Save position
-    ------------------------- */
-
-    latestPosition = {
-
-      ticker:
-        position
-          ?.instrument
-          ?.ticker
-        || "GPRO",
-
-      name:
-        position
-          ?.instrument
-          ?.name
-        || "GoPro",
-
-      quantity,
-
-      averagePricePaid,
-
-      currentPrice:
         price,
 
-      walletCurrency:
-        walletCurrency
-        || null,
+        timestamp,
 
-      currentValue:
-        walletCurrentValue,
+        "Finnhub quote"
 
-      totalCost:
-        walletTotalCost,
-    };
+      );
 
-    /* -------------------------
-       PUSH immediately
-       to the journal
-    ------------------------- */
 
-    broadcast({
+      lastRestRefresh =
+        Date.now();
 
-      type:
-        "trade",
 
-      symbol:
-        "GPRO",
+      lastError =
+        null;
 
-      price:
-        latestPrice,
+    }
 
-      timestamp:
-        latestTs,
+    else {
 
-      usdToGbp,
+      throw new Error(
+        "Finnhub returned no usable GPRO price."
+      );
 
-      source:
-        latestSource,
+    }
 
-      position:
-        latestPosition,
-    });
+  }
 
-  } catch (err) {
-
-    pollState =
-      "error";
+  catch (err) {
 
     lastError =
       err.message;
 
+
     console.error(
-      "Trading 212 poll failed:",
+      "Finnhub quote refresh failed:",
       err.message
     );
 
-  } finally {
-
-    pollInFlight =
-      false;
   }
+
 }
 
-/* -----------------------------
-   Main page
------------------------------ */
+
+/* =====================================
+   FINNHUB WEBSOCKET
+===================================== */
+
+let finnhubSocket =
+  null;
+
+let reconnectTimer =
+  null;
+
+let reconnectDelay =
+  3000;
+
+
+/* =====================================
+   RECONNECT
+===================================== */
+
+function scheduleReconnect() {
+
+  clearTimeout(
+    reconnectTimer
+  );
+
+
+  reconnectTimer =
+    setTimeout(
+
+      connectFinnhub,
+
+      reconnectDelay
+
+    );
+
+
+  reconnectDelay =
+    Math.min(
+
+      reconnectDelay * 2,
+
+      30000
+
+    );
+
+}
+
+
+/* =====================================
+   CONNECT FINNHUB
+===================================== */
+
+function connectFinnhub() {
+
+  clearTimeout(
+    reconnectTimer
+  );
+
+
+  finnhubState =
+    "connecting";
+
+
+  finnhubSocket =
+    new WebSocket(
+
+      `wss://ws.finnhub.io?token=${encodeURIComponent(
+        FINNHUB_API_KEY
+      )}`
+
+    );
+
+
+  /* -----------------------------
+     CONNECTED
+  ----------------------------- */
+
+  finnhubSocket.on(
+    "open",
+    () => {
+
+      finnhubState =
+        "connected";
+
+
+      reconnectDelay =
+        3000;
+
+
+      finnhubSocket.send(
+
+        JSON.stringify({
+
+          type:
+            "subscribe",
+
+          symbol:
+            SYMBOL,
+
+        })
+
+      );
+
+
+      console.log(
+        `Finnhub connected; subscribed to ${SYMBOL}`
+      );
+
+
+      /*
+        Update journal's connection
+        indicator immediately.
+      */
+
+      broadcast(
+        snapshotPayload(
+          "snapshot"
+        )
+      );
+
+    }
+  );
+
+
+  /* -----------------------------
+     LIVE TRADES
+  ----------------------------- */
+
+  finnhubSocket.on(
+    "message",
+    (raw) => {
+
+      try {
+
+        const msg =
+          JSON.parse(
+            raw.toString()
+          );
+
+
+        if (
+          msg.type !== "trade" ||
+          !Array.isArray(
+            msg.data
+          )
+        ) {
+
+          return;
+
+        }
+
+
+        const trades =
+          msg.data
+
+            .filter(
+
+              (trade) =>
+
+                trade.s === SYMBOL &&
+
+                Number(
+                  trade.p
+                ) > 0
+
+            )
+
+            .sort(
+
+              (a, b) =>
+
+                Number(
+                  a.t || 0
+                ) -
+
+                Number(
+                  b.t || 0
+                )
+
+            );
+
+
+        if (
+          !trades.length
+        ) {
+
+          return;
+
+        }
+
+
+        /*
+          A Finnhub message can
+          contain multiple trades.
+
+          Use the newest one.
+        */
+
+        const newest =
+          trades[
+            trades.length - 1
+          ];
+
+
+        updatePrice(
+
+          newest.p,
+
+          newest.t,
+
+          "Finnhub trade"
+
+        );
+
+      }
+
+      catch (err) {
+
+        console.error(
+          "Bad Finnhub WebSocket message:",
+          err.message
+        );
+
+      }
+
+    }
+  );
+
+
+  /* -----------------------------
+     DISCONNECTED
+  ----------------------------- */
+
+  finnhubSocket.on(
+    "close",
+    () => {
+
+      finnhubState =
+        "disconnected";
+
+
+      console.log(
+        "Finnhub disconnected; reconnecting..."
+      );
+
+
+      /*
+        Keep displaying the most
+        recent price while reconnecting.
+      */
+
+      broadcast(
+        snapshotPayload(
+          "snapshot"
+        )
+      );
+
+
+      scheduleReconnect();
+
+    }
+  );
+
+
+  /* -----------------------------
+     ERROR
+  ----------------------------- */
+
+  finnhubSocket.on(
+    "error",
+    (err) => {
+
+      finnhubState =
+        "error";
+
+
+      lastError =
+        err.message;
+
+
+      console.error(
+        "Finnhub WebSocket error:",
+        err.message
+      );
+
+
+      try {
+
+        finnhubSocket.close();
+
+      }
+
+      catch {}
+
+    }
+  );
+
+}
+
+
+/* =====================================
+   ROOT
+===================================== */
 
 app.get(
   "/",
@@ -564,29 +850,30 @@ app.get(
 
     res.json({
 
-      ok: true,
+      ok:
+        true,
 
       service:
-        "GPRO live feed",
-
-      source:
-        "Trading 212 positions API",
-
-      environment:
-        T212_ENV,
+        "GPRO Finnhub live-price bridge",
 
       websocketPath:
         "/ws",
 
       apiPath:
         "/api/gpro",
+
+      healthPath:
+        "/health",
+
     });
+
   }
 );
 
-/* -----------------------------
-   GPRO API
------------------------------ */
+
+/* =====================================
+   CURRENT GPRO PRICE
+===================================== */
 
 app.get(
   "/api/gpro",
@@ -597,54 +884,48 @@ app.get(
       "no-store"
     );
 
+
     res.json({
 
-      symbol:
-        "GPRO",
+      ...snapshotPayload(
+        "snapshot"
+      ),
 
-      price:
-        latestPrice,
-
-      timestamp:
-        latestTs,
-
-      usdToGbp,
-
-      source:
-        latestSource,
-
-      pollState,
-
-      lastSuccessfulPoll,
-
-      position:
-        latestPosition,
+      lastRestRefresh,
 
       error:
         lastError,
+
     });
+
   }
 );
 
-/* -----------------------------
-   Health check
------------------------------ */
+
+/* =====================================
+   HEALTH
+===================================== */
 
 app.get(
   "/health",
   (req, res) => {
 
+    const ageMs =
+      latestTs
+
+        ? Date.now() -
+          latestTs
+
+        : null;
+
+
     res.json({
 
       ok:
-        pollState !==
-        "error",
+        true,
 
-      trading212:
-        pollState,
-
-      environment:
-        T212_ENV,
+      finnhubWebsocket:
+        finnhubState,
 
       browserClients:
         wss.clients.size,
@@ -652,20 +933,46 @@ app.get(
       hasPrice:
         latestPrice !== null,
 
+      latestPrice,
+
+      latestTimestamp:
+        latestTs,
+
+      latestAgeSeconds:
+
+        ageMs === null
+
+          ? null
+
+          : Math.max(
+
+              0,
+
+              Math.round(
+                ageMs / 1000
+              )
+
+            ),
+
+      latestSource,
+
       hasFx:
         usdToGbp !== null,
 
-      lastSuccessfulPoll,
+      lastRestRefresh,
 
       error:
         lastError,
+
     });
+
   }
 );
 
-/* -----------------------------
-   Start server
------------------------------ */
+
+/* =====================================
+   START
+===================================== */
 
 server.listen(
   PORT,
@@ -676,23 +983,63 @@ server.listen(
       `GPRO live service listening on port ${PORT}`
     );
 
-    console.log(
-      `Trading 212 environment: ${T212_ENV}`
-    );
 
-    // Get first price
-    // immediately.
-    await pollTrading212();
+    /*
+      Immediately populate the journal
+      instead of starting at $—.
+    */
 
-    // Trading 212's positions
-    // endpoint is limited to
-    // one request per second.
-    //
-    // 1100ms gives a small
-    // buffer against HTTP 429.
+    await Promise.allSettled([
+
+      refreshFx(),
+
+      refreshFinnhubQuote(),
+
+    ]);
+
+
+    /*
+      REAL-TIME PATH
+
+      Finnhub pushes each trade
+      directly to Render.
+    */
+
+    connectFinnhub();
+
+
+    /*
+      BACKUP PATH
+
+      Every 15 seconds, ask for
+      Finnhub's latest quote.
+
+      This isn't the primary live feed;
+      it's there for missed updates,
+      reconnects and Render restarts.
+    */
+
     setInterval(
-      pollTrading212,
-      1100
+
+      refreshFinnhubQuote,
+
+      REST_REFRESH_MS
+
     );
+
+
+    /*
+      USD / GBP only needs
+      occasional refreshing.
+    */
+
+    setInterval(
+
+      refreshFx,
+
+      60 * 60 * 1000
+
+    );
+
   }
 );
