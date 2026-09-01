@@ -18,7 +18,7 @@ const app = express();
 
 app.use(
   cors({
-    origin: ALLOWED_ORIGIN === "*" ? true : ALLOWED_ORIGIN
+    origin: ALLOWED_ORIGIN === "*" ? true : ALLOWED_ORIGIN,
   })
 );
 
@@ -26,7 +26,7 @@ const server = http.createServer(app);
 
 const wss = new WebSocketServer({
   server,
-  path: "/ws"
+  path: "/ws",
 });
 
 let latestPrice = null;
@@ -37,7 +37,7 @@ let usdToGbp = null;
 let fxUpdatedAt = null;
 
 /* --------------------------------
-   Browser WebSocket helpers
+   Helpers
 -------------------------------- */
 
 function sendJson(client, data) {
@@ -53,7 +53,7 @@ function broadcast(data) {
 }
 
 /* --------------------------------
-   Browser connections
+   Browser WebSocket
 -------------------------------- */
 
 wss.on("connection", (client, req) => {
@@ -63,7 +63,9 @@ wss.on("connection", (client, req) => {
     ALLOWED_ORIGIN !== "*" &&
     origin !== ALLOWED_ORIGIN
   ) {
-    console.warn(`Rejected WebSocket origin: ${origin}`);
+    console.warn(
+      `Rejected WebSocket origin: ${origin}`
+    );
 
     client.close(
       1008,
@@ -83,8 +85,8 @@ wss.on("connection", (client, req) => {
     client.isAlive = true;
   });
 
-  // Send the latest known information
-  // immediately when the page connects.
+  // Immediately send current known data
+  // when the journal connects.
   sendJson(client, {
     type: "snapshot",
     symbol: "GPRO",
@@ -92,12 +94,12 @@ wss.on("connection", (client, req) => {
     timestamp: latestTs,
     usdToGbp,
     fxUpdatedAt,
-    feedState: wsState
+    feedState: wsState,
   });
 });
 
 /* --------------------------------
-   Keep browser WebSockets alive
+   WebSocket heartbeat
 -------------------------------- */
 
 const heartbeat = setInterval(() => {
@@ -132,43 +134,37 @@ async function refreshFx() {
       );
     }
 
-    const data = await response.json();
+    const data =
+      await response.json();
 
     const nextRate =
       Number(data?.rates?.GBP);
 
     if (nextRate > 0) {
       usdToGbp = nextRate;
+      fxUpdatedAt = Date.now();
 
-      fxUpdatedAt =
-        Date.now();
+      console.log(
+        `USD/GBP updated: ${usdToGbp}`
+      );
 
       broadcast({
         type: "fx",
         usdToGbp,
-        fxUpdatedAt
+        fxUpdatedAt,
       });
     }
 
   } catch (err) {
-
     console.error(
       "FX refresh failed:",
       err.message
     );
-
   }
 }
 
-refreshFx();
-
-setInterval(
-  refreshFx,
-  60 * 60 * 1000
-);
-
 /* --------------------------------
-   Finnhub WebSocket
+   Initial GPRO price
 -------------------------------- */
 
 async function getInitialGproPrice() {
@@ -180,17 +176,22 @@ async function getInitialGproPrice() {
     );
 
     if (!response.ok) {
-      throw new Error(`Quote HTTP ${response.status}`);
+      throw new Error(
+        `Quote HTTP ${response.status}`
+      );
     }
 
-    const data = await response.json();
+    const data =
+      await response.json();
 
     if (Number(data.c) > 0) {
-      latestPrice = Number(data.c);
+      latestPrice =
+        Number(data.c);
 
-      latestTs = Number(data.t)
-        ? Number(data.t) * 1000
-        : Date.now();
+      latestTs =
+        Number(data.t)
+          ? Number(data.t) * 1000
+          : Date.now();
 
       console.log(
         `Initial GPRO price loaded: $${latestPrice}`
@@ -201,9 +202,15 @@ async function getInitialGproPrice() {
         symbol: "GPRO",
         price: latestPrice,
         timestamp: latestTs,
-        usdToGbp
+        usdToGbp,
       });
+
+    } else {
+      console.warn(
+        "Initial GPRO quote returned no usable price."
+      );
     }
+
   } catch (err) {
     console.error(
       "Initial GPRO quote failed:",
@@ -212,168 +219,133 @@ async function getInitialGproPrice() {
   }
 }
 
-getInitialGproPrice();
-connectFinnhub();
-
-  clearTimeout(reconnectTimer);
-
-  wsState =
-    "connecting";
-
-  socket =
-    new WebSocket(
-
-      `wss://ws.finnhub.io?token=${encodeURIComponent(
-        FINNHUB_API_KEY
-      )}`
-
-    );
-
-  socket.on(
-    "open",
-    () => {
-
-      wsState =
-        "connected";
-
-      socket.send(
-        JSON.stringify({
-          type: "subscribe",
-          symbol: "GPRO"
-        })
-      );
-
-      console.log(
-        "Finnhub connected; subscribed to GPRO"
-      );
-
-    }
-  );
-
-  socket.on(
-    "message",
-    raw => {
-
-      try {
-
-        const msg =
-          JSON.parse(
-            raw.toString()
-          );
-
-        if (
-          msg.type === "trade" &&
-          Array.isArray(msg.data)
-        ) {
-
-          const trades =
-            msg.data.filter(
-              t =>
-                t.s === "GPRO" &&
-                Number(t.p) > 0
-            );
-
-          if (trades.length) {
-
-            const t =
-              trades[
-                trades.length - 1
-              ];
-
-            latestPrice =
-              Number(t.p);
-
-            latestTs =
-              Number(t.t) ||
-              Date.now();
-
-            // Immediately send the new
-            // GPRO trade to every journal
-            // currently connected.
-            broadcast({
-              type: "trade",
-              symbol: "GPRO",
-              price: latestPrice,
-              timestamp: latestTs,
-              usdToGbp
-            });
-
-          }
-
-        }
-
-      } catch (err) {
-
-        console.error(
-          "Bad Finnhub websocket message:",
-          err.message
-        );
-
-      }
-
-    }
-  );
-
-  socket.on(
-    "close",
-    () => {
-
-      wsState =
-        "disconnected";
-
-      console.log(
-        "Finnhub disconnected; reconnecting in 3 seconds..."
-      );
-
-      reconnectTimer =
-        setTimeout(
-          connectFinnhub,
-          3000
-        );
-
-    }
-  );
-
-  socket.on(
-    "error",
-    err => {
-
-      wsState =
-        "error";
-
-      console.error(
-        "Finnhub websocket error:",
-        err.message
-      );
-
-      try {
-        socket.close();
-      } catch {}
-
-    }
-  );
-
-}
-
-connectFinnhub();
-
 /* --------------------------------
-   HTTP endpoints
+   Finnhub live WebSocket
 -------------------------------- */
 
-app.get(
-  "/",
-  (req, res) => {
+let socket = null;
+let reconnectTimer = null;
 
-    res.json({
-      ok: true,
-      service: "GPRO live feed",
-      websocketPath: "/ws",
-      apiPath: "/api/gpro"
-    });
+function connectFinnhub() {
+  clearTimeout(reconnectTimer);
 
-  }
-);
+  wsState = "connecting";
+
+  socket = new WebSocket(
+    `wss://ws.finnhub.io?token=${encodeURIComponent(
+      FINNHUB_API_KEY
+    )}`
+  );
+
+  socket.on("open", () => {
+    wsState = "connected";
+
+    socket.send(
+      JSON.stringify({
+        type: "subscribe",
+        symbol: "GPRO",
+      })
+    );
+
+    console.log(
+      "Finnhub connected; subscribed to GPRO"
+    );
+  });
+
+  socket.on("message", (raw) => {
+    try {
+      const msg =
+        JSON.parse(
+          raw.toString()
+        );
+
+      if (
+        msg.type === "trade" &&
+        Array.isArray(msg.data)
+      ) {
+        const trades =
+          msg.data.filter(
+            (t) =>
+              t.s === "GPRO" &&
+              Number(t.p) > 0
+          );
+
+        if (trades.length > 0) {
+          const t =
+            trades[
+              trades.length - 1
+            ];
+
+          latestPrice =
+            Number(t.p);
+
+          latestTs =
+            Number(t.t) ||
+            Date.now();
+
+          broadcast({
+            type: "trade",
+            symbol: "GPRO",
+            price: latestPrice,
+            timestamp: latestTs,
+            usdToGbp,
+          });
+        }
+      }
+
+    } catch (err) {
+      console.error(
+        "Bad Finnhub websocket message:",
+        err.message
+      );
+    }
+  });
+
+  socket.on("close", () => {
+    wsState =
+      "disconnected";
+
+    console.log(
+      "Finnhub disconnected; reconnecting in 3 seconds..."
+    );
+
+    reconnectTimer =
+      setTimeout(
+        connectFinnhub,
+        3000
+      );
+  });
+
+  socket.on("error", (err) => {
+    wsState =
+      "error";
+
+    console.error(
+      "Finnhub websocket error:",
+      err.message
+    );
+
+    try {
+      socket.close();
+    } catch {}
+  });
+}
+
+/* --------------------------------
+   API endpoints
+-------------------------------- */
+
+app.get("/", (req, res) => {
+  res.json({
+    ok: true,
+    service:
+      "GPRO live feed",
+    websocketPath:
+      "/ws",
+    apiPath:
+      "/api/gpro",
+  });
+});
 
 app.get(
   "/api/gpro",
@@ -395,9 +367,8 @@ app.get(
       marketStatus:
         wsState === "connected"
           ? "Connected · waiting for trade"
-          : wsState
+          : wsState,
     });
-
   }
 );
 
@@ -418,9 +389,8 @@ app.get(
         latestPrice !== null,
 
       hasFx:
-        usdToGbp !== null
+        usdToGbp !== null,
     });
-
   }
 );
 
@@ -431,11 +401,19 @@ app.get(
 server.listen(
   PORT,
   "0.0.0.0",
-  () => {
+  async () => {
 
     console.log(
       `GPRO live service listening on port ${PORT}`
     );
 
+    // Load GBP conversion first
+    await refreshFx();
+
+    // Load latest GPRO price immediately
+    await getInitialGproPrice();
+
+    // Then begin real-time streaming
+    connectFinnhub();
   }
 );
