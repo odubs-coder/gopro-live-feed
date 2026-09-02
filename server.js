@@ -35,85 +35,578 @@ const wss = new WebSocketServer({
   path: "/ws"
 });
 
-/* ================================
-   CURRENT STATE
-================================ */
 
-let price = null;
-let marketTs = null;
-let observedTs = null;
-let source = "starting";
+/* =========================================================
+   SEPARATE PRICE SOURCES
+
+   IMPORTANT:
+   Finnhub and Stocktwits each keep their own timestamp.
+
+   This prevents an overnight price from permanently blocking
+   the daytime price.
+========================================================= */
+
+const feeds = {
+
+  finnhub: {
+    price: null,
+    marketTs: null,
+    observedTs: null,
+    label: null,
+    session: null
+  },
+
+  stocktwits: {
+    price: null,
+    marketTs: null,
+    observedTs: null,
+    label: null,
+    session: null
+  }
+
+};
+
+
+let active = {
+
+  price: null,
+
+  marketTs: null,
+
+  observedTs: null,
+
+  label: "starting",
+
+  session: "Unknown"
+
+};
+
 
 let usdToGbp = null;
+
 let fxUpdatedAt = null;
 
 let finnhubState = "connecting";
 
 let stocktwitsState = "idle";
+
 let stocktwitsUpdated = null;
+
 let stocktwitsLastSuccess = null;
+
 let lastStocktwitsAttempt = 0;
 
 let lastError = null;
 
 
-/* ================================
-   HELPERS
-================================ */
+/* =========================================================
+   BASIC HELPERS
+========================================================= */
 
 function send(client, data) {
+
   if (
     client.readyState ===
     WebSocket.OPEN
   ) {
+
     client.send(
       JSON.stringify(data)
     );
+
   }
+
 }
 
 
 function broadcast(data) {
+
   for (
     const client
     of wss.clients
   ) {
+
     send(
       client,
       data
     );
+
   }
+
 }
 
+
+/* =========================================================
+   TIMESTAMP NORMALISATION
+========================================================= */
+
+function normalizeTs(value) {
+
+  const n =
+    Number(value);
+
+
+  if (
+    Number.isFinite(n) &&
+    n > 0
+  ) {
+
+    /*
+      Nanoseconds
+    */
+
+    if (
+      n > 1e17
+    ) {
+
+      return Math.floor(
+        n / 1e6
+      );
+
+    }
+
+
+    /*
+      Milliseconds
+    */
+
+    if (
+      n > 1e12
+    ) {
+
+      return Math.floor(
+        n
+      );
+
+    }
+
+
+    /*
+      Seconds
+    */
+
+    return Math.floor(
+      n * 1000
+    );
+
+  }
+
+
+  const parsed =
+    Date.parse(
+      String(value)
+    );
+
+
+  if (
+    Number.isFinite(parsed)
+  ) {
+
+    return parsed;
+
+  }
+
+
+  return Date.now();
+
+}
+
+
+function ageMs(ts) {
+
+  if (!ts) {
+    return Infinity;
+  }
+
+
+  return Math.max(
+    0,
+    Date.now() - ts
+  );
+
+}
+
+
+function validFeed(feed) {
+
+  return (
+
+    feed &&
+
+    Number(feed.price) > 0 &&
+
+    Number(feed.marketTs) > 0
+
+  );
+
+}
+
+
+/* =========================================================
+   CHOOSE THE FRESHEST PRICE
+
+   This is the key part of the fix.
+
+   Whichever genuine market source has the newest timestamp
+   becomes the displayed price.
+
+   Therefore:
+
+   overnight → pre-market → market → after-hours → overnight
+
+   can all switch automatically.
+========================================================= */
+
+function chooseActiveFeed() {
+
+  const finnhub =
+    feeds.finnhub;
+
+
+  const stocktwits =
+    feeds.stocktwits;
+
+
+  let chosen =
+    null;
+
+
+  if (
+    validFeed(finnhub) &&
+    validFeed(stocktwits)
+  ) {
+
+    const difference =
+
+      finnhub.marketTs -
+      stocktwits.marketTs;
+
+
+    /*
+      If both timestamps are basically identical,
+      prefer Finnhub because its WebSocket trades are
+      our primary live source.
+    */
+
+    if (
+      Math.abs(
+        difference
+      ) <= 5000
+    ) {
+
+      chosen =
+        finnhub;
+
+    }
+
+    else {
+
+      chosen =
+
+        difference > 0
+          ? finnhub
+          : stocktwits;
+
+    }
+
+  }
+
+  else if (
+    validFeed(finnhub)
+  ) {
+
+    chosen =
+      finnhub;
+
+  }
+
+  else if (
+    validFeed(stocktwits)
+  ) {
+
+    chosen =
+      stocktwits;
+
+  }
+
+
+  if (!chosen) {
+
+    return false;
+
+  }
+
+
+  const changed =
+
+    active.price !==
+      chosen.price
+
+    ||
+
+    active.marketTs !==
+      chosen.marketTs
+
+    ||
+
+    active.label !==
+      chosen.label
+
+    ||
+
+    active.session !==
+      chosen.session;
+
+
+  active = {
+
+    price:
+      chosen.price,
+
+    marketTs:
+      chosen.marketTs,
+
+    observedTs:
+      chosen.observedTs,
+
+    label:
+      chosen.label,
+
+    session:
+      chosen.session
+
+  };
+
+
+  if (
+    changed
+  ) {
+
+    console.log(
+
+      `ACTIVE GPRO -> $${active.price} | ${active.label} | ${active.session} | ${new Date(
+        active.marketTs
+      ).toISOString()}`
+
+    );
+
+
+    broadcast(
+      snapshot(
+        "price"
+      )
+    );
+
+  }
+
+
+  return true;
+
+}
+
+
+/* =========================================================
+   STORE A PRICE FOR ONE SOURCE
+========================================================= */
+
+function storeFeed(
+  name,
+  nextPrice,
+  nextTs,
+  label,
+  session,
+  observed = Date.now()
+) {
+
+  const price =
+    Number(
+      nextPrice
+    );
+
+
+  const timestamp =
+    normalizeTs(
+      nextTs
+    );
+
+
+  if (
+    !(price > 0) ||
+    !(timestamp > 0)
+  ) {
+
+    return false;
+
+  }
+
+
+  const previous =
+    feeds[name];
+
+
+  const reference =
+
+    Number(
+      previous?.price
+    ) > 0
+
+      ? previous.price
+
+      : Number(
+          active.price
+        ) > 0
+
+        ? active.price
+
+        : null;
+
+
+  /*
+    Very wide safety filter.
+
+    Only meant to reject an obviously unrelated
+    number scraped from the page.
+  */
+
+  if (
+    reference &&
+
+    (
+      price <
+        reference * 0.15
+
+      ||
+
+      price >
+        reference * 7
+    )
+  ) {
+
+    console.warn(
+
+      `Rejected suspicious ${label} price ${price}`
+
+    );
+
+
+    return false;
+
+  }
+
+
+  /*
+    CRITICAL:
+
+    We only compare the timestamp against the
+    SAME source.
+
+    Finnhub is not allowed to block Stocktwits,
+    and Stocktwits is not allowed to block Finnhub.
+  */
+
+  if (
+    previous.marketTs &&
+    timestamp <
+      previous.marketTs
+  ) {
+
+    return false;
+
+  }
+
+
+  feeds[name] = {
+
+    price,
+
+    marketTs:
+      timestamp,
+
+    observedTs:
+      observed,
+
+    label,
+
+    session
+
+  };
+
+
+  lastError =
+    null;
+
+
+  chooseActiveFeed();
+
+
+  return true;
+
+}
+
+
+/* =========================================================
+   API SNAPSHOT
+========================================================= */
 
 function snapshot(
   type = "snapshot"
 ) {
+
   return {
+
     type,
 
     symbol:
       SYMBOL,
 
-    price,
+
+    price:
+      active.price,
+
 
     timestamp:
-      marketTs,
+      active.marketTs,
+
 
     marketTimestamp:
-      marketTs,
+      active.marketTs,
+
 
     observedTimestamp:
-      observedTs,
+      active.observedTs,
+
 
     serverTime:
       Date.now(),
+
+
+    source:
+      active.label,
+
+
+    session:
+      active.session,
+
+
+    priceAgeSeconds:
+
+      active.marketTs
+
+        ? Math.round(
+
+            ageMs(
+              active.marketTs
+            ) / 1000
+
+          )
+
+        : null,
+
 
     usdToGbp,
 
     fxUpdatedAt,
 
-    source,
 
     finnhubState,
 
@@ -121,101 +614,54 @@ function snapshot(
 
     stocktwitsUpdated,
 
-    stocktwitsLastSuccess
+    stocktwitsLastSuccess,
+
+
+    feeds: {
+
+      finnhub: {
+
+        price:
+          feeds.finnhub.price,
+
+        timestamp:
+          feeds.finnhub.marketTs,
+
+        source:
+          feeds.finnhub.label,
+
+        session:
+          feeds.finnhub.session
+
+      },
+
+
+      stocktwits: {
+
+        price:
+          feeds.stocktwits.price,
+
+        timestamp:
+          feeds.stocktwits.marketTs,
+
+        source:
+          feeds.stocktwits.label,
+
+        session:
+          feeds.stocktwits.session
+
+      }
+
+    }
+
   };
+
 }
 
 
-/* ================================
-   UPDATE PRICE
-================================ */
-
-function setPrice(
-  nextPrice,
-  nextTs,
-  nextSource,
-  observed = Date.now()
-) {
-  const p =
-    Number(nextPrice);
-
-  const ts =
-    Number(nextTs) ||
-    observed;
-
-
-  if (!(p > 0)) {
-    return false;
-  }
-
-
-  /*
-    Prevent an older quote
-    overwriting a newer price.
-  */
-
-  if (
-    marketTs &&
-    ts < marketTs
-  ) {
-    return false;
-  }
-
-
-  /*
-    Safety check.
-
-    Prevent an unrelated dollar
-    value from accidentally being
-    treated as the GPRO price.
-  */
-
-  if (
-    price &&
-    (
-      p < price * 0.20 ||
-      p > price * 5
-    )
-  ) {
-
-    console.warn(
-      `Rejected suspicious ${nextSource} price ${p}`
-    );
-
-    return false;
-  }
-
-
-  price =
-    p;
-
-  marketTs =
-    ts;
-
-  observedTs =
-    observed;
-
-  source =
-    nextSource;
-
-  lastError =
-    null;
-
-
-  broadcast(
-    snapshot(
-      "price"
-    )
-  );
-
-
-  return true;
-}
-
-
-/* ================================
-   HTML CLEANER
-================================ */
+/* =========================================================
+   CLEAN STOCKTWITS HTML
+========================================================= */
 
 function stripHtml(html) {
 
@@ -262,36 +708,45 @@ function stripHtml(html) {
     )
 
     .trim();
+
 }
 
 
-/* ================================
+/* =========================================================
    STOCKTWITS UPDATED TIME
-================================ */
 
-function parseUpdatedTime(
+   Example:
+
+   Updated 11:38 AM EDT
+========================================================= */
+
+function parseStocktwitsUpdatedTime(
   text
 ) {
 
   const match =
     text.match(
+
       /Updated\s+(\d{1,2}:\d{2})\s*(AM|PM)\s*(EDT|EST)/i
+
     );
 
 
   if (!match) {
+
     return null;
+
   }
 
 
-  const now =
-    new Date();
+  const parts =
 
-
-  const dateParts =
     new Intl.DateTimeFormat(
+
       "en-US",
+
       {
+
         timeZone:
           "America/New_York",
 
@@ -303,18 +758,20 @@ function parseUpdatedTime(
 
         day:
           "2-digit"
+
       }
+
     ).formatToParts(
-      now
+      new Date()
     );
 
 
-  const parts = {};
+  const date = {};
 
 
   for (
     const part
-    of dateParts
+    of parts
   ) {
 
     if (
@@ -322,7 +779,7 @@ function parseUpdatedTime(
       "literal"
     ) {
 
-      parts[
+      date[
         part.type
       ] =
         part.value;
@@ -332,165 +789,517 @@ function parseUpdatedTime(
   }
 
 
-  const parsed =
-    Date.parse(
+  /*
+    EDT = UTC-4
+    EST = UTC-5
+  */
 
-      `${parts.month}/${parts.day}/${parts.year} ${match[1]} ${match[2]} ${match[3]}`
+  let [
+    hour,
+    minute
+  ] = match[1]
 
-    );
+    .split(":")
+
+    .map(Number);
+
+
+  const ampm =
+    match[2]
+      .toUpperCase();
 
 
   if (
-    !Number.isFinite(
-      parsed
-    )
+    ampm === "PM" &&
+    hour !== 12
   ) {
 
-    return null;
+    hour += 12;
 
   }
+
+
+  if (
+    ampm === "AM" &&
+    hour === 12
+  ) {
+
+    hour = 0;
+
+  }
+
+
+  const offsetHours =
+
+    match[3]
+      .toUpperCase() ===
+      "EDT"
+
+      ? 4
+
+      : 5;
+
+
+  const timestamp =
+    Date.UTC(
+
+      Number(
+        date.year
+      ),
+
+      Number(
+        date.month
+      ) - 1,
+
+      Number(
+        date.day
+      ),
+
+      hour +
+        offsetHours,
+
+      minute,
+
+      0
+
+    );
 
 
   return {
 
-    timestamp:
-      parsed,
+    timestamp,
 
     label:
+
       `${match[1]} ${match[2].toUpperCase()} ${match[3].toUpperCase()}`
 
   };
+
 }
 
 
-/* ================================
-   BROWSER WEBSOCKET
-================================ */
+/* =========================================================
+   STOCKTWITS PRICE REFRESH
+========================================================= */
 
-wss.on(
-  "connection",
-  (
-    client,
-    req
-  ) => {
+async function refreshStocktwits(
+  force = false
+) {
 
-    const origin =
-      req.headers.origin;
+  const now =
+    Date.now();
+
+
+  /*
+    Minimum five seconds between page requests.
+  */
+
+  if (
+    now -
+      lastStocktwitsAttempt <
+      5000
+  ) {
+
+    return false;
+
+  }
+
+
+  lastStocktwitsAttempt =
+    now;
+
+
+  stocktwitsState =
+    "checking";
+
+
+  try {
+
+    const response =
+      await fetch(
+
+        STOCKTWITS_URL,
+
+        {
+
+          cache:
+            "no-store",
+
+          redirect:
+            "follow",
+
+          headers: {
+
+            "User-Agent":
+              "Mozilla/5.0 (compatible; GoProJournal/3.0)",
+
+            "Accept":
+              "text/html,application/xhtml+xml",
+
+            "Accept-Language":
+              "en-US,en;q=0.9"
+
+          }
+
+        }
+
+      );
 
 
     if (
-      ALLOWED_ORIGIN !== "*" &&
-      origin &&
-      origin !==
-        ALLOWED_ORIGIN
+      !response.ok
     ) {
 
-      client.close(
-        1008,
-        "Origin not allowed"
+      throw new Error(
+
+        `Stocktwits HTTP ${response.status}`
+
       );
 
-      return;
+    }
+
+
+    const html =
+      await response.text();
+
+
+    const text =
+      stripHtml(
+        html
+      );
+
+
+    /* --------------------------
+       VERIFY GPRO PAGE
+    -------------------------- */
+
+    const identity =
+
+      /\bGPRO\b/i.test(
+        text
+      )
+
+      &&
+
+      /\bGoPro(?:,\s*Inc\.?| Inc\.?)\b/i.test(
+        text
+      );
+
+
+    if (
+      !identity
+    ) {
+
+      throw new Error(
+
+        "Stocktwits GPRO identity validation failed"
+
+      );
 
     }
+
+
+    /* --------------------------
+       FIND CURRENT PRICE + SESSION
+    -------------------------- */
+
+    const block =
+      text.match(
+
+        /GPRO\s+GoPro(?:,\s*Inc\.?| Inc\.?)\s+\$([0-9]+(?:\.[0-9]+)?)[\s\S]{0,240}?\b(Overnight|Pre-Market|After-Hours|After Hours|Today|Closed)\b/i
+
+      );
+
+
+    if (
+      !block
+    ) {
+
+      stocktwitsState =
+        "quote-not-found";
+
+
+      throw new Error(
+
+        "Stocktwits GPRO quote block not found"
+
+      );
+
+    }
+
+
+    const displayedPrice =
+      Number(
+        block[1]
+      );
+
+
+    const sessionRaw =
+      block[2];
+
+
+    let session =
+      "Regular";
+
+
+    if (
+      /overnight/i.test(
+        sessionRaw
+      )
+    ) {
+
+      session =
+        "Overnight";
+
+    }
+
+    else if (
+      /pre[\s-]?market/i.test(
+        sessionRaw
+      )
+    ) {
+
+      session =
+        "Pre-Market";
+
+    }
+
+    else if (
+      /after[\s-]?hours/i.test(
+        sessionRaw
+      )
+    ) {
+
+      session =
+        "After-Hours";
+
+    }
+
+
+    if (
+      !(displayedPrice > 0)
+    ) {
+
+      throw new Error(
+
+        "Invalid Stocktwits GPRO price"
+
+      );
+
+    }
+
+
+    /* --------------------------
+       PREVIOUS CLOSE CHECK
+    -------------------------- */
+
+    const closeMatch =
+
+      text.match(
+
+        /Prev Close\s+\$([0-9]+(?:\.[0-9]+)?)/i
+
+      )
+
+      ||
+
+      text.match(
+
+        /Closed\s+\$([0-9]+(?:\.[0-9]+)?)/i
+
+      );
+
+
+    if (
+      closeMatch
+    ) {
+
+      const close =
+        Number(
+          closeMatch[1]
+        );
+
+
+      if (
+        close > 0
+      ) {
+
+        const ratio =
+
+          displayedPrice /
+          close;
+
+
+        if (
+          ratio < 0.15 ||
+          ratio > 7
+        ) {
+
+          throw new Error(
+
+            `Stocktwits sanity check failed (${displayedPrice} vs ${close})`
+
+          );
+
+        }
+
+      }
+
+    }
+
+
+    /* --------------------------
+       STOCKTWITS TIME
+    -------------------------- */
+
+    const updated =
+
+      parseStocktwitsUpdatedTime(
+        text
+      );
+
+
+    const marketTimestamp =
+
+      updated?.timestamp ||
+
+      now;
+
+
+    stocktwitsUpdated =
+
+      updated?.label ||
+
+      null;
+
+
+    /* --------------------------
+       SOURCE NAME
+    -------------------------- */
+
+    const label =
+
+      session ===
+      "Overnight"
+
+        ? "Stocktwits overnight"
+
+        : session ===
+          "Pre-Market"
+
+          ? "Stocktwits pre-market"
+
+          : session ===
+            "After-Hours"
+
+            ? "Stocktwits after-hours"
+
+            : "Stocktwits regular";
+
+
+    /* --------------------------
+       STORE IT
+    -------------------------- */
+
+    const accepted =
+      storeFeed(
+
+        "stocktwits",
+
+        displayedPrice,
+
+        marketTimestamp,
+
+        label,
+
+        session,
+
+        now
+
+      );
+
+
+    stocktwitsLastSuccess =
+      now;
+
+
+    stocktwitsState =
+
+      session ===
+      "Overnight"
+
+        ? "overnight-found"
+
+        : session ===
+          "Pre-Market"
+
+          ? "pre-market"
+
+          : session ===
+            "After-Hours"
+
+            ? "after-hours"
+
+            : "regular";
 
 
     console.log(
-      "Journal connected to live feed"
+
+      `Stocktwits ${session}: $${displayedPrice}`
+
+      +
+
+      (
+
+        stocktwitsUpdated
+
+          ? ` @ ${stocktwitsUpdated}`
+
+          : ""
+
+      )
+
     );
 
 
-    client.isAlive =
-      true;
-
-
-    client.on(
-      "pong",
-      () => {
-
-        client.isAlive =
-          true;
-
-      }
-    );
-
-
-    /*
-      Send current price
-      immediately.
-    */
-
-    send(
-      client,
-      snapshot()
-    );
+    return accepted;
 
   }
-);
 
+  catch (
+    err
+  ) {
 
-/* ================================
-   KEEP JOURNAL CONNECTION OPEN
-================================ */
-
-setInterval(
-  () => {
-
-    for (
-      const client
-      of wss.clients
+    if (
+      stocktwitsState ===
+      "checking"
     ) {
 
-      if (
-        client.isAlive ===
-        false
-      ) {
-
-        client.terminate();
-
-        continue;
-
-      }
-
-
-      client.isAlive =
-        false;
-
-
-      client.ping();
+      stocktwitsState =
+        "error";
 
     }
 
-  },
 
-  30000
+    console.error(
 
-);
+      "Stocktwits:",
 
+      err.message
 
-/* ================================
-   JOURNAL UPDATE EVERY SECOND
-================================ */
-
-setInterval(
-  () => {
-
-    broadcast(
-      snapshot(
-        "heartbeat"
-      )
     );
 
-  },
 
-  1000
+    return false;
 
-);
+  }
+
+}
 
 
-/* ================================
+/* =========================================================
    USD → GBP
-================================ */
+========================================================= */
 
 async function refreshFx() {
 
@@ -514,7 +1323,9 @@ async function refreshFx() {
     ) {
 
       throw new Error(
+
         `FX HTTP ${response.status}`
+
       );
 
     }
@@ -565,8 +1376,11 @@ async function refreshFx() {
   ) {
 
     console.error(
+
       "FX:",
+
       err.message
+
     );
 
   }
@@ -574,9 +1388,9 @@ async function refreshFx() {
 }
 
 
-/* ================================
+/* =========================================================
    FINNHUB REST BACKUP
-================================ */
+========================================================= */
 
 async function refreshFinnhub() {
 
@@ -602,7 +1416,9 @@ async function refreshFinnhub() {
     ) {
 
       throw new Error(
+
         `Finnhub HTTP ${response.status}`
+
       );
 
     }
@@ -623,34 +1439,43 @@ async function refreshFinnhub() {
     ) {
 
       throw new Error(
+
         "No usable Finnhub price"
+
       );
 
     }
 
 
     const timestamp =
+
       Number(
         data.t
       ) > 0
 
         ? Number(
             data.t
-          ) *
-          1000
+          ) * 1000
 
         : Date.now();
 
 
-    setPrice(
+    storeFeed(
+
+      "finnhub",
 
       currentPrice,
 
       timestamp,
 
-      "Finnhub quote"
+      "Finnhub quote",
+
+      "Market",
+
+      Date.now()
 
     );
+
 
   }
 
@@ -658,13 +1483,17 @@ async function refreshFinnhub() {
     err
   ) {
 
-    lastError =
-      err.message;
-
+    /*
+      REST failure is not fatal if the
+      Finnhub WebSocket is still connected.
+    */
 
     console.error(
+
       "Finnhub REST:",
+
       err.message
+
     );
 
   }
@@ -672,465 +1501,17 @@ async function refreshFinnhub() {
 }
 
 
-/* ================================
-   STOCKTWITS SESSION PRICE
-================================ */
+/* =========================================================
+   FINNHUB LIVE WEBSOCKET
+========================================================= */
 
-async function refreshStocktwits(
-  force = false
-) {
+let finnhubSocket =
+  null;
 
-  const now =
-    Date.now();
 
+let reconnectTimer =
+  null;
 
-  /*
-    Don't hammer the site
-    if refresh is clicked
-    repeatedly.
-  */
-
-  if (
-    now -
-      lastStocktwitsAttempt
-      <
-      5000
-  ) {
-
-    return false;
-
-  }
-
-
-  lastStocktwitsAttempt =
-    now;
-
-
-  stocktwitsState =
-    "checking";
-
-
-  try {
-
-    const response =
-      await fetch(
-
-        STOCKTWITS_URL,
-
-        {
-
-          cache:
-            "no-store",
-
-          redirect:
-            "follow",
-
-          headers: {
-
-            "User-Agent":
-              "Mozilla/5.0 (compatible; GoProJournal/1.0)",
-
-            "Accept":
-              "text/html,application/xhtml+xml",
-
-            "Accept-Language":
-              "en-US,en;q=0.9"
-
-          }
-
-        }
-
-      );
-
-
-    if (
-      !response.ok
-    ) {
-
-      throw new Error(
-        `Stocktwits HTTP ${response.status}`
-      );
-
-    }
-
-
-    const html =
-      await response.text();
-
-
-    const text =
-      stripHtml(
-        html
-      );
-
-
-    /* ------------------------------
-       VERIFY PAGE IS GPRO
-    ------------------------------ */
-
-    const identityValid =
-
-      /\bGPRO\b/i.test(
-        text
-      )
-
-      &&
-
-      /\bGoPro(?:,\s*Inc\.?| Inc\.?)\b/i.test(
-        text
-      );
-
-
-    if (
-      !identityValid
-    ) {
-
-      throw new Error(
-        "GPRO / GoPro identity validation failed"
-      );
-
-    }
-
-
-    /* ------------------------------
-       READ MAIN GPRO PRICE
-
-       Stocktwits may say:
-
-       Overnight
-       Pre-Market
-       After-Hours
-       Today
-       Closed
-
-       We accept any session.
-    ------------------------------ */
-
-    const quoteBlock =
-      text.match(
-
-        /GPRO\s+GoPro(?:,\s*Inc\.?| Inc\.?)\s+\$([0-9]+(?:\.[0-9]+)?)[\s\S]{0,180}?\b(Overnight|Pre-Market|After-Hours|After Hours|Today|Closed)\b/i
-
-      );
-
-
-    if (
-      !quoteBlock
-    ) {
-
-      stocktwitsState =
-        "quote-not-found";
-
-
-      throw new Error(
-        "Could not locate Stocktwits GPRO quote/session block"
-      );
-
-    }
-
-
-    const displayedPrice =
-      Number(
-        quoteBlock[1]
-      );
-
-
-    let session =
-      quoteBlock[2]
-
-        .replace(
-          /\s+/g,
-          " "
-        )
-
-        .trim();
-
-
-    /* ------------------------------
-       NORMALISE SESSION NAME
-    ------------------------------ */
-
-    if (
-      /after[\s-]?hours/i.test(
-        session
-      )
-    ) {
-
-      session =
-        "After-Hours";
-
-    }
-
-    else if (
-      /pre[\s-]?market/i.test(
-        session
-      )
-    ) {
-
-      session =
-        "Pre-Market";
-
-    }
-
-    else if (
-      /overnight/i.test(
-        session
-      )
-    ) {
-
-      session =
-        "Overnight";
-
-    }
-
-    else {
-
-      session =
-        "Regular";
-
-    }
-
-
-    if (
-      !(displayedPrice > 0)
-    ) {
-
-      throw new Error(
-        "Stocktwits displayed GPRO price was invalid"
-      );
-
-    }
-
-
-    /* ------------------------------
-       PREVIOUS CLOSE SAFETY CHECK
-    ------------------------------ */
-
-    const closeMatch =
-
-      text.match(
-        /Prev Close\s+\$([0-9]+(?:\.[0-9]+)?)/i
-      )
-
-      ||
-
-      text.match(
-        /Closed\s+\$([0-9]+(?:\.[0-9]+)?)/i
-      );
-
-
-    const referenceClose =
-      closeMatch
-
-        ? Number(
-            closeMatch[1]
-          )
-
-        : null;
-
-
-    if (
-      referenceClose > 0
-    ) {
-
-      const ratio =
-        displayedPrice /
-        referenceClose;
-
-
-      /*
-        Very wide range.
-
-        Only rejects a clearly
-        unrelated dollar figure.
-      */
-
-      if (
-        ratio < 0.15 ||
-        ratio > 7
-      ) {
-
-        throw new Error(
-
-          `Stocktwits price failed sanity check (${displayedPrice} vs ${referenceClose})`
-
-        );
-
-      }
-
-    }
-
-
-    /* ------------------------------
-       READ UPDATED TIME
-    ------------------------------ */
-
-    const updated =
-      parseUpdatedTime(
-        text
-      );
-
-
-    const timestamp =
-      updated
-
-        ? updated.timestamp
-
-        : now;
-
-
-    /* ------------------------------
-       SOURCE LABEL
-    ------------------------------ */
-
-    const sourceName =
-
-      session ===
-      "Overnight"
-
-        ? "Stocktwits overnight"
-
-        : `Stocktwits ${session}`;
-
-
-    /* ------------------------------
-       SAVE PRICE
-    ------------------------------ */
-
-    const accepted =
-      setPrice(
-
-        displayedPrice,
-
-        timestamp,
-
-        sourceName,
-
-        now
-
-      );
-
-
-    stocktwitsUpdated =
-      updated?.label ||
-      null;
-
-
-    if (
-      accepted
-    ) {
-
-      stocktwitsLastSuccess =
-        now;
-
-
-      if (
-        session ===
-        "Overnight"
-      ) {
-
-        stocktwitsState =
-          "overnight-found";
-
-      }
-
-      else {
-
-        stocktwitsState =
-          session
-
-            .toLowerCase()
-
-            .replace(
-              /\s+/g,
-              "-"
-            );
-
-      }
-
-
-      console.log(
-
-        `Stocktwits GPRO ${session}: $${displayedPrice}`
-
-        +
-
-        (
-          stocktwitsUpdated
-
-            ? ` · Updated ${stocktwitsUpdated}`
-
-            : ""
-        )
-
-      );
-
-    }
-
-    else {
-
-      /*
-        Parser succeeded but
-        Finnhub already had a
-        newer timestamp.
-      */
-
-      stocktwitsState =
-
-        session ===
-        "Overnight"
-
-          ? "overnight-parsed-stale"
-
-          : `${session
-              .toLowerCase()
-              .replace(
-                /\s+/g,
-                "-"
-              )}-parsed-stale`;
-
-    }
-
-
-    return accepted;
-
-  }
-
-  catch (
-    err
-  ) {
-
-    if (
-      stocktwitsState ===
-      "checking"
-    ) {
-
-      stocktwitsState =
-        "error";
-
-    }
-
-
-    console.error(
-      "Stocktwits:",
-      err.message
-    );
-
-
-    return false;
-
-  }
-
-}
-
-
-/* ================================
-   FINNHUB WEBSOCKET
-================================ */
-
-let finnhubSocket;
-
-let reconnectTimer;
 
 let reconnectDelay =
   3000;
@@ -1156,10 +1537,6 @@ function connectFinnhub() {
 
     );
 
-
-  /* ------------------------------
-     CONNECTED
-  ------------------------------ */
 
   finnhubSocket.on(
     "open",
@@ -1189,7 +1566,9 @@ function connectFinnhub() {
 
 
       console.log(
+
         "Finnhub connected; subscribed to GPRO"
+
       );
 
 
@@ -1203,10 +1582,6 @@ function connectFinnhub() {
   );
 
 
-  /* ------------------------------
-     LIVE TRADE
-  ------------------------------ */
-
   finnhubSocket.on(
     "message",
     raw => {
@@ -1214,6 +1589,7 @@ function connectFinnhub() {
       try {
 
         const msg =
+
           JSON.parse(
             raw.toString()
           );
@@ -1222,7 +1598,9 @@ function connectFinnhub() {
         if (
           msg.type !==
             "trade"
+
           ||
+
           !Array.isArray(
             msg.data
           )
@@ -1233,14 +1611,16 @@ function connectFinnhub() {
         }
 
 
-        const validTrades =
+        const valid =
           msg.data
 
             .filter(
 
               trade =>
 
-                trade.s ===
+                String(
+                  trade.s
+                ).toUpperCase() ===
                   SYMBOL
 
                 &&
@@ -1272,7 +1652,7 @@ function connectFinnhub() {
 
 
         if (
-          !validTrades.length
+          !valid.length
         ) {
 
           return;
@@ -1280,25 +1660,32 @@ function connectFinnhub() {
         }
 
 
-        const newestTrade =
-          validTrades[
-            validTrades.length -
+        const newest =
+
+          valid[
+            valid.length -
             1
           ];
 
 
-        setPrice(
+        storeFeed(
+
+          "finnhub",
 
           Number(
-            newestTrade.p
+            newest.p
           ),
 
           Number(
-            newestTrade.t
+            newest.t
           ) ||
             Date.now(),
 
-          "Finnhub trade"
+          "Finnhub trade",
+
+          "Market",
+
+          Date.now()
 
         );
 
@@ -1309,8 +1696,11 @@ function connectFinnhub() {
       ) {
 
         console.error(
+
           "Finnhub WS message:",
+
           err.message
+
         );
 
       }
@@ -1318,10 +1708,6 @@ function connectFinnhub() {
     }
   );
 
-
-  /* ------------------------------
-     DISCONNECTED
-  ------------------------------ */
 
   finnhubSocket.on(
     "close",
@@ -1332,7 +1718,9 @@ function connectFinnhub() {
 
 
       console.log(
+
         "Finnhub disconnected; reconnecting..."
+
       );
 
 
@@ -1360,10 +1748,6 @@ function connectFinnhub() {
   );
 
 
-  /* ------------------------------
-     ERROR
-  ------------------------------ */
-
   finnhubSocket.on(
     "error",
     err => {
@@ -1372,13 +1756,12 @@ function connectFinnhub() {
         "error";
 
 
-      lastError =
-        err.message;
-
-
       console.error(
+
         "Finnhub WebSocket:",
+
         err.message
+
       );
 
 
@@ -1396,9 +1779,146 @@ function connectFinnhub() {
 }
 
 
-/* ================================
+/* =========================================================
+   JOURNAL WEBSOCKET
+========================================================= */
+
+wss.on(
+  "connection",
+  (
+    client,
+    req
+  ) => {
+
+    const origin =
+      req.headers.origin;
+
+
+    if (
+      ALLOWED_ORIGIN !== "*" &&
+
+      origin &&
+
+      origin !==
+        ALLOWED_ORIGIN
+    ) {
+
+      client.close(
+
+        1008,
+
+        "Origin not allowed"
+
+      );
+
+
+      return;
+
+    }
+
+
+    console.log(
+
+      "Journal connected to live feed"
+
+    );
+
+
+    client.isAlive =
+      true;
+
+
+    client.on(
+      "pong",
+      () => {
+
+        client.isAlive =
+          true;
+
+      }
+    );
+
+
+    /*
+      Immediately send current price.
+    */
+
+    send(
+
+      client,
+
+      snapshot()
+
+    );
+
+  }
+);
+
+
+/* =========================================================
+   KEEP WEBSOCKET ALIVE
+========================================================= */
+
+setInterval(
+  () => {
+
+    for (
+      const client
+      of wss.clients
+    ) {
+
+      if (
+        client.isAlive ===
+        false
+      ) {
+
+        client.terminate();
+
+        continue;
+
+      }
+
+
+      client.isAlive =
+        false;
+
+
+      client.ping();
+
+    }
+
+  },
+
+  30000
+
+);
+
+
+/* =========================================================
+   1 SECOND JOURNAL HEARTBEAT
+========================================================= */
+
+setInterval(
+  () => {
+
+    broadcast(
+
+      snapshot(
+        "heartbeat"
+      )
+
+    );
+
+  },
+
+  1000
+
+);
+
+
+/* =========================================================
    ROOT
-================================ */
+========================================================= */
 
 app.get(
   "/",
@@ -1413,13 +1933,10 @@ app.get(
         true,
 
       service:
-        "GPRO live journal feed",
+        "GPRO live journal feed v3",
 
-      liveSource:
-        "Finnhub",
-
-      secondarySource:
-        "Stocktwits public GPRO page",
+      logic:
+        "Freshest validated market timestamp wins",
 
       websocket:
         "/ws",
@@ -1436,9 +1953,9 @@ app.get(
 );
 
 
-/* ================================
-   PRICE API
-================================ */
+/* =========================================================
+   GPRO API
+========================================================= */
 
 app.get(
   "/api/gpro",
@@ -1448,18 +1965,13 @@ app.get(
   ) => {
 
     res.set(
+
       "Cache-Control",
+
       "no-store"
+
     );
 
-
-    /*
-      Manual journal refresh:
-
-      force a fresh Stocktwits
-      check and Finnhub REST
-      check before responding.
-    */
 
     if (
       req.query.refresh ===
@@ -1468,13 +1980,16 @@ app.get(
 
       await Promise.allSettled([
 
+        refreshFinnhub(),
+
         refreshStocktwits(
           true
-        ),
-
-        refreshFinnhub()
+        )
 
       ]);
+
+
+      chooseActiveFeed();
 
     }
 
@@ -1492,9 +2007,9 @@ app.get(
 );
 
 
-/* ================================
+/* =========================================================
    HEALTH
-================================ */
+========================================================= */
 
 app.get(
   "/health",
@@ -1502,6 +2017,9 @@ app.get(
     req,
     res
   ) => {
+
+    chooseActiveFeed();
+
 
     res.json({
 
@@ -1514,38 +2032,80 @@ app.get(
       browserClients:
         wss.clients.size,
 
+
       hasPrice:
-        price !== null,
+        active.price !==
+        null,
+
 
       latestPrice:
-        price,
+        active.price,
+
 
       latestMarketTimestamp:
-        marketTs,
+        active.marketTs,
 
-      latestObservedTimestamp:
-        observedTs,
 
       latestSource:
-        source,
+        active.label,
+
+
+      latestSession:
+        active.session,
+
+
+      latestAgeSeconds:
+
+        active.marketTs
+
+          ? Math.round(
+
+              ageMs(
+                active.marketTs
+              ) /
+                1000
+
+            )
+
+          : null,
+
 
       finnhub:
         finnhubState,
 
+
       stocktwits:
         stocktwitsState,
 
+
       stocktwitsUpdated,
+
 
       stocktwitsLastSuccess,
 
+
+      feeds: {
+
+        finnhub:
+          feeds.finnhub,
+
+        stocktwits:
+          feeds.stocktwits
+
+      },
+
+
       hasFx:
-        usdToGbp !== null,
+        usdToGbp !==
+        null,
+
 
       usdToGbp,
 
+
       serverTime:
         Date.now(),
+
 
       error:
         lastError
@@ -1556,9 +2116,9 @@ app.get(
 );
 
 
-/* ================================
-   START SERVER
-================================ */
+/* =========================================================
+   START
+========================================================= */
 
 server.listen(
   PORT,
@@ -1566,15 +2126,14 @@ server.listen(
   async () => {
 
     console.log(
-      `GPRO live service listening on port ${PORT}`
+
+      `GPRO live service v3 listening on port ${PORT}`
+
     );
 
 
     /*
-      Immediately get:
-      - GBP FX
-      - Finnhub price
-      - Stocktwits session price
+      Load all initial data.
     */
 
     await Promise.allSettled([
@@ -1590,17 +2149,18 @@ server.listen(
     ]);
 
 
+    chooseActiveFeed();
+
+
     /*
-      Start Finnhub realtime
-      WebSocket.
+      Start live Finnhub trades.
     */
 
     connectFinnhub();
 
 
     /*
-      Finnhub REST safety
-      refresh every 15 sec.
+      Finnhub REST backup every 15 seconds.
     */
 
     setInterval(
@@ -1613,13 +2173,19 @@ server.listen(
 
 
     /*
-      Stocktwits session lookup
-      every 30 sec.
+      Stocktwits every 15 seconds.
 
-      When Stocktwits switches
-      to Overnight, the same
-      parser automatically
-      detects it.
+      This allows us to detect session changes:
+
+      Overnight
+          ↓
+      Pre-market
+          ↓
+      Regular
+          ↓
+      After-hours
+          ↓
+      Overnight
     */
 
     setInterval(
@@ -1629,14 +2195,27 @@ server.listen(
           false
         ),
 
-      30000
+      15000
 
     );
 
 
     /*
-      GBP exchange rate
-      every hour.
+      Re-evaluate which source is freshest
+      every five seconds.
+    */
+
+    setInterval(
+
+      chooseActiveFeed,
+
+      5000
+
+    );
+
+
+    /*
+      Update currency conversion hourly.
     */
 
     setInterval(
@@ -1644,8 +2223,8 @@ server.listen(
       refreshFx,
 
       60 *
-      60 *
-      1000
+        60 *
+        1000
 
     );
 
